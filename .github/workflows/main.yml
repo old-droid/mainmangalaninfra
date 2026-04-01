@@ -1,67 +1,78 @@
-name: Perpetual Persistent Runner
+name: Perpetual Total System Runner
 on: 
   push:
   workflow_dispatch:
   repository_dispatch:
-    types: [restart-runner] # Custom trigger for the loop
+    types: [restart-runner]
 
 permissions:
   contents: write
-  actions: write # Required to trigger the next workflow run
+  actions: write 
 
 jobs:
-  environment:
+  terminal-session:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Reassemble Chunked Files
+      - name: Import and Restore System
         run: |
-          # Import: Finds .part_aa files and merges them back into the original
-          find . -name "*.part_aa" | while read part_aa; do
-            base_file="${part_aa%.part_aa}"
-            echo "Reassembling $base_file..."
-            cat "${base_file}.part_"* > "$base_file"
-            rm "${base_file}.part_"*
-          done
+          # 1. Reassemble chunks if they exist
+          if ls system_backup.tar.gz.part_* 1> /dev/null 2>&1; then
+            echo "Reassembling system backup..."
+            cat system_backup.tar.gz.part_* > system_backup.tar.gz
+            
+            # 2. Extract (Unzip) to Root /
+            echo "Restoring system state to root..."
+            # We use --overwrite and ignore errors for protected system files
+            sudo tar -xzf system_backup.tar.gz -C / --overwrite || true
+            
+            # Clean up the large zip to save disk space for work
+            rm system_backup.tar.gz
+          else
+            echo "No previous system backup found. Starting fresh."
+          fi
 
       - name: Install and Up Tailscale
         run: |
+          # Re-installing Tailscale ensures the binary is fresh even if the backup was old
           curl -fsSL https://tailscale.com/install.sh | sh
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-ultra-node
 
-      - name: Prepare Workspace
-        run: |
-          rm -f .gitignore
-          echo "Access via: tailscale ssh runner@gh-ultra-node"
-
       - name: Active Session
-        # Set to ~5 hours to ensure we have time to sync and restart before the 6h hard limit
+        # 5 hours of work time
         run: sleep 18000 
 
-      - name: Deep Sync, Re-Chunk, and Restart
+      - name: Backup, Chunk, and Restart
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          # 1. Export: Chunk files > 90MB for the 100MB limit
-          find . -type f -size +90M -not -path '*/.git/*' -exec split -b 90M {} {}.part_ \; -exec rm {} \;
 
-          # 2. Force Sync everything to Repo
-          git add -A --force
-          if ! git diff --cached --quiet; then
-            git commit -m "Auto-Sync: $(date +'%Y-%m-%d %H:%M:%S')"
-            git push origin HEAD:${{ github.ref }} --force
-          fi
+          echo "Zipping entire filesystem..."
+          # Archive the root, excluding temp/virtual/repo files
+          sudo tar -czf system_backup.tar.gz / \
+            --exclude=/system_backup.tar.gz \
+            --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
+            --exclude=/boot --exclude=/lost+found --exclude=/media --exclude=/mnt \
+            --exclude=/var/lib/docker \
+            --exclude=${{ github.workspace }} \
+            --one-file-system || true
 
-          # 3. TRIGGER RESTART: Send a dispatch to start a new runner immediately
-          echo "Triggering recursive restart..."
+          # 3. Chunking for GitHub's 100MB limit
+          echo "Chunking for export..."
+          split -b 90M system_backup.tar.gz system_backup.tar.gz.part_
+          rm system_backup.tar.gz
+
+          # 4. Push back to Repo
+          git add system_backup.tar.gz.part_*
+          git commit -m "Total System State: $(date +'%Y-%m-%d %H:%M:%S')"
+          git push origin HEAD:${{ github.ref }} --force
+
+          # 5. Trigger Restart
           curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
                -H "Accept: application/vnd.github.v3+json" \
                https://api.github.com/repos/${{ github.repository }}/dispatches \
