@@ -1,5 +1,6 @@
-name: Perpetual Total System Runner
-on: 
+name: Persistent Runner Loop
+
+on:
   push:
   workflow_dispatch:
   repository_dispatch:
@@ -7,66 +8,82 @@ on:
 
 permissions:
   contents: write
-  actions: write 
+  actions: write
 
 jobs:
-  terminal-session:
+  runner:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Import and Restore System
+      # Restore small state only
+      - name: Restore State
         run: |
-          if ls system_backup.tar.gz.part_* 1> /dev/null 2>&1; then
-            echo "Reassembling system backup..."
-            cat system_backup.tar.gz.part_* > system_backup.tar.gz
-            echo "Restoring system state to root..."
-            sudo tar -xzf system_backup.tar.gz -C / --overwrite || true
-            rm system_backup.tar.gz
+          if [ -f state.tar.gz ]; then
+            echo "Restoring state..."
+            tar -xzf state.tar.gz || true
           else
-            echo "No previous system backup found."
+            echo "No state found"
           fi
 
-      - name: Install and Up Tailscale
+      # Optional: your tool setup (safe)
+      - name: Setup Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-ultra-node
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --ssh --hostname=gh-node || true
 
+      # Your "active session"
       - name: Active Session
-        run: sleep 18000 || true 
+        run: |
+          echo "Running..."
+          sleep 1800   # 30 min (safe vs 5h kill risk)
 
-      - name: Backup, Chunk, and Restart
+      # Save minimal state only
+      - name: Save State
+        if: always()
+        run: |
+          mkdir -p state
+          
+          # Example state (customize this)
+          echo "$(date)" > state/last_run.txt
+
+          tar -czf state.tar.gz state
+
+      # Commit safely (only if changed)
+      - name: Commit State
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state.tar.gz
+
+          if ! git diff --cached --quiet; then
+            git commit -m "State update: $(date +'%Y-%m-%d %H:%M:%S')"
+          else
+            echo "No changes"
+          fi
+
+      # Push with retry (prevents random failure)
+      - name: Push Changes
+        if: always()
+        run: |
+          for i in 1 2 3; do
+            git push origin HEAD:${{ github.ref }} && break
+            echo "Retry $i..."
+            sleep 5
+          done
+
+      # Restart loop
+      - name: Restart Runner
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global http.postBuffer 524288000
-
-          echo "Cleaning and Zipping..."
-          sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*
-          
-          sudo tar -czf system_backup.tar.gz / \
-            --exclude=/system_backup.tar.gz \
-            --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-            --exclude=/boot --exclude=/var/cache --exclude=/var/log \
-            --exclude=${{ github.workspace }} \
-            --one-file-system 2> /dev/null || true
-
-          echo "Chunking and Pushing..."
-          split -b 90M system_backup.tar.gz system_backup.tar.gz.part_
-          rm system_backup.tar.gz
-
-          git add system_backup.tar.gz.part_*
-          if ! git diff --cached --quiet; then
-            git commit -m "Total System Sync: $(date +'%Y-%m-%d %H:%M:%S')"
-            git push origin HEAD:${{ github.ref }} --force
-          fi
-
-          echo "Triggering Restart..."
-          curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
-               -H "Accept: application/vnd.github.v3+json" \
-               https://api.github.com/repos/${{ github.repository }}/dispatches \
-               -d '{"event_type": "restart-runner"}'
+          curl -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{"event_type": "restart-runner"}'
